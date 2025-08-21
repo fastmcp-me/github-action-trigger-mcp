@@ -10,6 +10,7 @@ This is a TypeScript-based MCP server designed for GitHub Actions integration. I
 - Tool for getting detailed information about a specific GitHub Action
 - Tool for triggering GitHub workflow dispatch events
 - Tool for fetching the latest releases from a GitHub repository
+- Tool for enabling auto-merge on pull requests
 
 ## Features
 
@@ -43,6 +44,17 @@ This is a TypeScript-based MCP server designed for GitHub Actions integration. I
   - Required parameters: `owner` (repository owner, username or organization) and `repo` (repository name)
   - Optional parameters: `token` (GitHub personal access token, optional)
   - Returns information about the latest 2 releases
+
+- `enable_pull_request_automerge` - Enable auto-merge for a specific pull request
+  - Required parameters:
+    - `owner`: Repository owner (username or organization)
+    - `repo`: Repository name
+    - `pull_number`: The pull request number
+  - Optional parameters:
+    - `merge_method`: The merge method to use (MERGE, SQUASH, or REBASE, default: MERGE)
+    - `token`: GitHub personal access token (optional)
+  - Returns success status and pull request information
+  - Note: This will automatically merge the PR when all required checks pass and approvals are met
 
 ## Installation
 
@@ -358,4 +370,41 @@ Example response:
     }
   ]
 }
+```
+
+### Enabling Auto-merge for Pull Requests
+
+Use the `enable_pull_request_automerge` tool to enable auto-merge for a specific pull request:
+
+```json
+{
+  "owner": "username-or-org",
+  "repo": "repository-name",
+  "pull_number": 123,
+  "merge_method": "SQUASH"
+}
+```
+
+Example response:
+
+```json
+{
+  "success": true,
+  "message": "Auto-merge enabled successfully",
+  "pullRequest": {
+    "id": "PR_kwDOABCD123_456",
+    "title": "Add new feature",
+    "number": 123,
+    "autoMergeEnabled": true,
+    "enabledAt": "2025-08-21T03:00:00Z",
+    "mergeMethod": "SQUASH"
+  }
+}
+```
+
+Note: Enabling auto-merge requires:
+1. The repository must have auto-merge enabled in settings
+2. The GitHub token must have write permissions to the repository
+3. The pull request must be open and not already have auto-merge enabled
+4. Once enabled, the PR will automatically merge when all required status checks pass and approvals are met
 ```
