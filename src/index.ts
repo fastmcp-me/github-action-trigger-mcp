@@ -212,6 +212,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["owner", "repo"]
         }
+      },
+      {
+        name: "enable_pull_request_automerge",
+        description: "Enable auto-merge for a specific pull request. This will automatically merge the PR when all required checks pass.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            owner: {
+              type: "string",
+              description: "Owner of the repository (username or organization)"
+            },
+            repo: {
+              type: "string",
+              description: "Name of the repository"
+            },
+            pull_number: {
+              type: "number",
+              description: "The pull request number"
+            },
+            merge_method: {
+              type: "string",
+              description: "The merge method to use when auto-merging (MERGE, SQUASH, or REBASE)",
+              enum: ["MERGE", "SQUASH", "REBASE"]
+            },
+            token: {
+              type: "string",
+              description: "GitHub personal access token (optional)"
+            }
+          },
+          required: ["owner", "repo", "pull_number"]
+        }
       }
     ]
   };
@@ -337,6 +368,162 @@ async function triggerGitHubAction(owner: string, repo: string, workflow_id: str
  * @param token Optional GitHub personal access token
  * @returns Detailed information about the GitHub Action
  */
+/**
+ * Helper function to enable auto-merge for a pull request using GraphQL API.
+ * @param owner Repository owner (username or organization)
+ * @param repo Repository name
+ * @param pullNumber The pull request number
+ * @param mergeMethod The merge method to use (MERGE, SQUASH, or REBASE)
+ * @param token GitHub personal access token
+ * @returns Result of enabling auto-merge
+ */
+async function enablePullRequestAutoMerge(owner: string, repo: string, pullNumber: number, mergeMethod: string = 'MERGE', token?: string) {
+  // Use provided token or fall back to config token
+  const authToken = token || config.githubToken;
+  
+  if (!authToken) {
+    throw new Error('GitHub token is required to enable pull request auto-merge');
+  }
+  
+  try {
+    const headers: Record<string, string> = {
+      'Accept': 'application/vnd.github+json',
+      'Authorization': `Bearer ${authToken}`,
+      'Content-Type': 'application/json'
+    };
+    
+    // First, get the pull request ID using GraphQL
+    const getPullRequestIdQuery = {
+      query: `
+        query GetPullRequestId($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              id
+              title
+              state
+              autoMergeRequest {
+                enabledAt
+                mergeMethod
+              }
+            }
+          }
+        }
+      `,
+      variables: {
+        owner: owner,
+        repo: repo,
+        number: pullNumber
+      }
+    };
+    
+    const pullRequestResponse = await axios.post(
+      'https://api.github.com/graphql',
+      getPullRequestIdQuery,
+      { headers }
+    );
+    
+    if (pullRequestResponse.data.errors) {
+      throw new Error(`GraphQL error: ${JSON.stringify(pullRequestResponse.data.errors)}`);
+    }
+    
+    const pullRequest = pullRequestResponse.data.data?.repository?.pullRequest;
+    if (!pullRequest) {
+      throw new Error(`Pull request #${pullNumber} not found in ${owner}/${repo}`);
+    }
+    
+    if (pullRequest.state !== 'OPEN') {
+      throw new Error(`Pull request #${pullNumber} is not open (current state: ${pullRequest.state})`);
+    }
+    
+    // Check if auto-merge is already enabled
+    if (pullRequest.autoMergeRequest) {
+      return {
+        success: true,
+        message: 'Auto-merge is already enabled for this pull request',
+        pullRequest: {
+          id: pullRequest.id,
+          title: pullRequest.title,
+          number: pullNumber,
+          autoMergeEnabled: true,
+          enabledAt: pullRequest.autoMergeRequest.enabledAt,
+          mergeMethod: pullRequest.autoMergeRequest.mergeMethod
+        }
+      };
+    }
+    
+    const pullRequestId = pullRequest.id;
+    
+    // Now enable auto-merge using the mutation
+    const enableAutoMergeMutation = {
+      query: `
+        mutation EnablePullRequestAutoMerge($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
+          enablePullRequestAutoMerge(input: {
+            pullRequestId: $pullRequestId,
+            mergeMethod: $mergeMethod
+          }) {
+            pullRequest {
+              id
+              title
+              number
+              autoMergeRequest {
+                enabledAt
+                mergeMethod
+              }
+            }
+          }
+        }
+      `,
+      variables: {
+        pullRequestId: pullRequestId,
+        mergeMethod: mergeMethod
+      }
+    };
+    
+    const enableResponse = await axios.post(
+      'https://api.github.com/graphql',
+      enableAutoMergeMutation,
+      { headers }
+    );
+    
+    if (enableResponse.data.errors) {
+      throw new Error(`Failed to enable auto-merge: ${JSON.stringify(enableResponse.data.errors)}`);
+    }
+    
+    const result = enableResponse.data.data?.enablePullRequestAutoMerge?.pullRequest;
+    if (!result) {
+      throw new Error('Unexpected response from GitHub API');
+    }
+    
+    return {
+      success: true,
+      message: 'Auto-merge enabled successfully',
+      pullRequest: {
+        id: result.id,
+        title: result.title,
+        number: result.number,
+        autoMergeEnabled: true,
+        enabledAt: result.autoMergeRequest.enabledAt,
+        mergeMethod: result.autoMergeRequest.mergeMethod
+      }
+    };
+    
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      const statusCode = error.response?.status;
+      const errorMessage = error.response?.data?.message || error.message;
+      
+      if (statusCode === 401 || statusCode === 403) {
+        throw new Error(`Authentication failed: ${errorMessage}. Make sure your token has the required permissions.`);
+      } else if (statusCode === 404) {
+        throw new Error(`Repository or pull request not found: ${errorMessage}`);
+      }
+      
+      throw new Error(`GitHub API error: ${statusCode} - ${errorMessage}`);
+    }
+    throw error;
+  }
+}
+
 /**
  * Helper function to fetch the latest releases from a GitHub repository.
  * @param owner Repository owner (username or organization)
@@ -642,6 +829,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } catch (error) {
         if (error instanceof Error) {
           throw new Error(`Failed to get GitHub releases: ${error.message}`);
+        }
+        throw error;
+      }
+    }
+    
+    case "enable_pull_request_automerge": {
+      const owner = String(request.params.arguments?.owner);
+      const repo = String(request.params.arguments?.repo);
+      const pullNumber = Number(request.params.arguments?.pull_number);
+      const mergeMethod = request.params.arguments?.merge_method ? String(request.params.arguments?.merge_method) : 'MERGE';
+      const token = request.params.arguments?.token ? String(request.params.arguments?.token) : undefined;
+      
+      if (!owner || !repo || !pullNumber) {
+        throw new Error("Owner, repo, and pull_number are required");
+      }
+      
+      if (isNaN(pullNumber) || pullNumber <= 0) {
+        throw new Error("pull_number must be a valid positive integer");
+      }
+      
+      const validMergeMethods = ['MERGE', 'SQUASH', 'REBASE'];
+      if (!validMergeMethods.includes(mergeMethod)) {
+        throw new Error(`merge_method must be one of: ${validMergeMethods.join(', ')}`);
+      }
+
+      try {
+        const result = await enablePullRequestAutoMerge(owner, repo, pullNumber, mergeMethod, token);
+        
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }]
+        };
+      } catch (error) {
+        if (error instanceof Error) {
+          throw new Error(`Failed to enable pull request auto-merge: ${error.message}`);
         }
         throw error;
       }
